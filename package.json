@@ -1,6 +1,6 @@
 {
   "name": "scrypted-amcrest-ash21",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "description": "Amcrest ASH21 PTZ Camera Plugin for Scrypted - Full PTZ control via DVRIP protocol",
   "author": "Joshua Blasbalg",
   "license": "MIT",
