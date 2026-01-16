@@ -1,0 +1,20 @@
+{
+  "name": "scrypted-amcrest-ash21",
+  "version": "1.0.2",
+  "description": "Amcrest ASH21 PTZ Camera Plugin for Scrypted - Full PTZ control via DVRIP protocol",
+  "main": "main.nodejs.js",
+  "scrypted": {
+    "name": "Amcrest ASH21 PTZ",
+    "type": "DeviceProvider",
+    "interfaces": [
+      "DeviceProvider",
+      "Settings"
+    ],
+    "deviceInterfaces": [
+      "Camera",
+      "VideoCamera",
+      "PanTiltZoom",
+      "Settings"
+    ]
+  }
+}
