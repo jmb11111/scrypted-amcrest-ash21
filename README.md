@@ -62,12 +62,14 @@ You may need to fine-tune these settings in the Amcrest app for optimal performa
 
 ## Plugin Configuration
 
-1. After installation, go to the plugin settings in Scrypted
-2. Enter your camera details:
+1. After installation, add a camera via the plugin's **Add Camera** setting (enter its IP)
+2. Open the new camera device and enter its details:
    - **IP Address**: Your camera's IP (e.g., 10.10.10.68)
    - **Username**: Camera username (default: admin)
    - **Password**: Camera password
-   - **ONVIF Port**: Port for ONVIF server (default: 8483)
+   - **Enable ONVIF Server**: Turn this on if you want PTZ control from Frigate or another ONVIF client
+   - **ONVIF Server Port**: Port for the ONVIF server (default: 8483, must be unique per camera)
+   - **PTZ Move Duration (ms)**: How long a relative PTZ nudge runs before auto-stopping (default: 300). Lower = finer steps, higher = bigger steps.
 
 ## Frigate Integration
 
@@ -83,6 +85,59 @@ cameras:
       user: admin
       password: ""
 ```
+
+## Multiple Cameras
+
+Each camera runs its own ONVIF server inside Scrypted, so **each camera needs its own ONVIF port**. Add each camera through the plugin's **Add Camera** setting, then give every camera a distinct port in its settings.
+
+Worked example — an office camera and a kitchen camera on the same Scrypted host:
+
+| Camera  | Camera IP    | ONVIF Server Port |
+|---------|--------------|-------------------|
+| office  | 10.10.10.68  | 8483              |
+| kitchen | 10.10.10.69  | 8484              |
+
+```yaml
+# frigate config.yml
+cameras:
+  office:
+    onvif:
+      host: YOUR_SCRYPTED_IP
+      port: 8483
+      user: admin
+      password: ""
+  kitchen:
+    onvif:
+      host: YOUR_SCRYPTED_IP
+      port: 8484
+      user: admin
+      password: ""
+```
+
+Notes:
+- The host is always your **Scrypted server's IP** (the plugin bridges to the camera), not the camera's IP.
+- Each camera is assigned a stable, unique MAC address derived from its IP, so ONVIF clients that identify devices by MAC won't confuse two cameras.
+- ONVIF WS-Discovery (UDP 3702) is shared best-effort between cameras; if discovery doesn't find a camera, add it manually by IP and port.
+
+## Troubleshooting
+
+### ONVIF server won't start
+- **Port already in use**: another camera or service is using the ONVIF port. Give each camera a unique port (see Multiple Cameras above). Check the device console for `EADDRINUSE`.
+- **"Camera IP not configured"**: set the camera's IP Address in the device settings first.
+- After changing the ONVIF port or IP the server restarts automatically; check the device console for `[ONVIF] Server started at ...` and use that exact URL in your client.
+
+### PTZ not responding
+- Verify the **DVRIP port** (default 37777) is reachable from Scrypted: `nc -vz CAMERA_IP 37777`.
+- Check credentials — look for `[DVRIP] Login failed` in the device console.
+- Watch the device console while sending a PTZ command; you should see the ONVIF request and the DVRIP command. If a command fails once, the plugin automatically reconnects and retries before giving up.
+- If moves are too small/large, tune **PTZ Move Duration (ms)** in the camera settings.
+
+### Connection drops
+- The plugin keeps the DVRIP session alive with a keepalive every 25s. If the keepalive fails (camera reboot, WiFi drop), the connection is closed and automatically re-established on the next PTZ command — expect the first command after a drop to be slightly slower.
+- Frequent `[DVRIP] Keepalive failed` messages usually indicate an unstable network path to the camera (common on WiFi); consider ethernet.
+
+### Snapshots
+- The ONVIF `GetSnapshotUri` endpoint returns the RTSP stream URL (the camera has no HTTP snapshot endpoint). Clients that require an HTTP JPEG snapshot should grab frames from the RTSP stream instead; within Scrypted, snapshots are taken from the substream automatically.
 
 ## Supported Cameras
 
