@@ -158,8 +158,6 @@ class AmcrestASH21Camera extends ScryptedDeviceBase implements Camera, VideoCame
     }
 
     private async handleOnvifPtz(command: any): Promise<void> {
-        const dvrip = await this.ensureDvripConnected();
-
         const getSpeed = (value: number | undefined): number => {
             if (value === undefined || value === 0) return 0;
             return Math.min(8, Math.max(1, Math.ceil(Math.abs(value) * 8)));
@@ -167,9 +165,9 @@ class AmcrestASH21Camera extends ScryptedDeviceBase implements Camera, VideoCame
 
         if (command.type === 'stop') {
             // Stop all movement
-            await dvrip.ptzControl('Left', 0, 'stop').catch(() => {});
-            await dvrip.ptzControl('Up', 0, 'stop').catch(() => {});
-            await dvrip.ptzControl('ZoomIn', 0, 'stop').catch(() => {});
+            await this.ptzWithRetry('Left', 0, 'stop').catch(() => {});
+            await this.ptzWithRetry('Up', 0, 'stop').catch(() => {});
+            await this.ptzWithRetry('ZoomIn', 0, 'stop').catch(() => {});
             return;
         }
 
@@ -181,15 +179,15 @@ class AmcrestASH21Camera extends ScryptedDeviceBase implements Camera, VideoCame
             // Continuous move - start movement in direction
             if (pan !== 0) {
                 const direction = pan > 0 ? 'Right' : 'Left';
-                await dvrip.ptzControl(direction, getSpeed(pan), 'start');
+                await this.ptzWithRetry(direction, getSpeed(pan), 'start');
             }
             if (tilt !== 0) {
                 const direction = tilt > 0 ? 'Up' : 'Down';
-                await dvrip.ptzControl(direction, getSpeed(tilt), 'start');
+                await this.ptzWithRetry(direction, getSpeed(tilt), 'start');
             }
             if (zoom !== 0) {
                 const direction = zoom > 0 ? 'ZoomIn' : 'ZoomOut';
-                await dvrip.ptzControl(direction, getSpeed(zoom), 'start');
+                await this.ptzWithRetry(direction, getSpeed(zoom), 'start');
             }
         } else if (command.type === 'relative') {
             // Relative move - move briefly then stop
@@ -197,18 +195,18 @@ class AmcrestASH21Camera extends ScryptedDeviceBase implements Camera, VideoCame
 
             if (pan !== 0) {
                 const direction = pan > 0 ? 'Right' : 'Left';
-                await dvrip.ptzControl(direction, getSpeed(pan), 'start');
-                setTimeout(() => dvrip.ptzControl(direction, 0, 'stop').catch(() => {}), duration);
+                await this.ptzWithRetry(direction, getSpeed(pan), 'start');
+                setTimeout(() => this.ptzWithRetry(direction, 0, 'stop').catch(() => {}), duration);
             }
             if (tilt !== 0) {
                 const direction = tilt > 0 ? 'Up' : 'Down';
-                await dvrip.ptzControl(direction, getSpeed(tilt), 'start');
-                setTimeout(() => dvrip.ptzControl(direction, 0, 'stop').catch(() => {}), duration);
+                await this.ptzWithRetry(direction, getSpeed(tilt), 'start');
+                setTimeout(() => this.ptzWithRetry(direction, 0, 'stop').catch(() => {}), duration);
             }
             if (zoom !== 0) {
                 const direction = zoom > 0 ? 'ZoomIn' : 'ZoomOut';
-                await dvrip.ptzControl(direction, getSpeed(zoom), 'start');
-                setTimeout(() => dvrip.ptzControl(direction, 0, 'stop').catch(() => {}), duration);
+                await this.ptzWithRetry(direction, getSpeed(zoom), 'start');
+                setTimeout(() => this.ptzWithRetry(direction, 0, 'stop').catch(() => {}), duration);
             }
         }
     }
@@ -329,6 +327,9 @@ class AmcrestASH21Camera extends ScryptedDeviceBase implements Camera, VideoCame
                 throw new Error('Camera IP not configured');
             }
 
+            // Tear down any stale client so its socket and keepalive timer don't leak
+            this.dvrip?.disconnect();
+
             this.dvrip = new DahuaDVRIP({
                 host,
                 port: this.getDvripPort(),
@@ -348,14 +349,32 @@ class AmcrestASH21Camera extends ScryptedDeviceBase implements Camera, VideoCame
             }
         })();
 
-        const success = await this.dvripConnecting;
-        this.dvripConnecting = null;
+        let success: boolean;
+        try {
+            success = await this.dvripConnecting;
+        } finally {
+            this.dvripConnecting = null;
+        }
 
         if (!success) {
             throw new Error('DVRIP login failed');
         }
 
         return this.dvrip!;
+    }
+
+    private async ptzWithRetry(direction: string, speed: number, action: 'start' | 'stop'): Promise<void> {
+        let dvrip = await this.ensureDvripConnected();
+        try {
+            await dvrip.ptzControl(direction, speed, action);
+        } catch (e: any) {
+            // One reconnect-and-retry so a dropped/idle connection doesn't fail the command
+            this.console.warn(`[DVRIP] ptz.${action} ${direction} failed (${e.message}), reconnecting and retrying...`);
+            this.dvrip?.disconnect();
+            this.dvrip = null;
+            dvrip = await this.ensureDvripConnected();
+            await dvrip.ptzControl(direction, speed, action);
+        }
     }
 
     // VideoCamera interface
@@ -432,8 +451,6 @@ class AmcrestASH21Camera extends ScryptedDeviceBase implements Camera, VideoCame
 
     // PanTiltZoom interface
     async ptzCommand(command: PanTiltZoomCommand): Promise<void> {
-        const dvrip = await this.ensureDvripConnected();
-
         // Map normalized values (-1 to 1) to DVRIP commands
         // Speed is derived from magnitude
         const getSpeed = (value: number | undefined): number => {
@@ -450,43 +467,25 @@ class AmcrestASH21Camera extends ScryptedDeviceBase implements Camera, VideoCame
             if (pan !== undefined && pan !== 0) {
                 const direction = pan > 0 ? 'Right' : 'Left';
                 const speed = getSpeed(pan);
-                await dvrip.ptzControl(direction, speed, 'start');
+                await this.ptzWithRetry(direction, speed, 'start');
                 // Stop after brief movement for relative control
-                setTimeout(async () => {
-                    try {
-                        await dvrip.ptzControl(direction, 0, 'stop');
-                    } catch (e) {
-                        // Ignore stop errors
-                    }
-                }, 200);
+                setTimeout(() => this.ptzWithRetry(direction, 0, 'stop').catch(() => {}), 200);
             }
 
             // Handle tilt
             if (tilt !== undefined && tilt !== 0) {
                 const direction = tilt > 0 ? 'Up' : 'Down';
                 const speed = getSpeed(tilt);
-                await dvrip.ptzControl(direction, speed, 'start');
-                setTimeout(async () => {
-                    try {
-                        await dvrip.ptzControl(direction, 0, 'stop');
-                    } catch (e) {
-                        // Ignore stop errors
-                    }
-                }, 200);
+                await this.ptzWithRetry(direction, speed, 'start');
+                setTimeout(() => this.ptzWithRetry(direction, 0, 'stop').catch(() => {}), 200);
             }
 
             // Handle zoom
             if (zoom !== undefined && zoom !== 0) {
                 const direction = zoom > 0 ? 'ZoomIn' : 'ZoomOut';
                 const speed = getSpeed(zoom);
-                await dvrip.ptzControl(direction, speed, 'start');
-                setTimeout(async () => {
-                    try {
-                        await dvrip.ptzControl(direction, 0, 'stop');
-                    } catch (e) {
-                        // Ignore stop errors
-                    }
-                }, 200);
+                await this.ptzWithRetry(direction, speed, 'start');
+                setTimeout(() => this.ptzWithRetry(direction, 0, 'stop').catch(() => {}), 200);
             }
         } catch (e: any) {
             this.console.error('PTZ command error:', e.message);
