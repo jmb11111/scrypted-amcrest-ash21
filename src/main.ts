@@ -145,6 +145,17 @@ class AmcrestASH21Camera extends ScryptedDeviceBase implements Camera, VideoCame
 
         try {
             await this.onvifServerStarting;
+        } catch (e) {
+            // Don't leave a half-started server behind; a non-null onvifServer
+            // would make future start attempts no-op.
+            // Assertion needed: TS narrows onvifServer from the early return above,
+            // but the async closure assigns it in the meantime.
+            const server = this.onvifServer as OnvifServer | null;
+            if (server) {
+                await server.stop().catch(() => {});
+            }
+            this.onvifServer = null;
+            throw e;
         } finally {
             this.onvifServerStarting = null;
         }

@@ -709,13 +709,33 @@ export class OnvifServer extends EventEmitter {
         return this.extractPTZVelocity(body); // Same format
     }
 
-    // WS-Discovery
+    // WS-Discovery. Best-effort: discovery failing (e.g. port 3702 taken) must not
+    // prevent the SOAP server from running, and must never leave start() hanging.
     private async startDiscovery(): Promise<void> {
         return new Promise((resolve) => {
+            let settled = false;
+            const settle = () => {
+                if (!settled) {
+                    settled = true;
+                    resolve();
+                }
+            };
+
+            const disableDiscovery = (reason: string) => {
+                this.console.error(`[ONVIF Server] WS-Discovery disabled (${reason}). SOAP server is unaffected; add the camera by IP/port instead of discovery.`);
+                try {
+                    this.discoverySocket?.close();
+                } catch (e) {
+                    // Socket may never have bound
+                }
+                this.discoverySocket = null;
+                settle();
+            };
+
             this.discoverySocket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
 
             this.discoverySocket.on('error', (err) => {
-                this.console.error('[ONVIF Server] Discovery error:', err.message);
+                disableDiscovery(err.message);
             });
 
             this.discoverySocket.on('message', (msg, rinfo) => {
@@ -727,9 +747,14 @@ export class OnvifServer extends EventEmitter {
             });
 
             this.discoverySocket.bind(3702, '0.0.0.0', () => {
-                this.discoverySocket!.addMembership('239.255.255.250');
+                try {
+                    this.discoverySocket!.addMembership('239.255.255.250');
+                } catch (e: any) {
+                    disableDiscovery(`multicast join failed: ${e.message}`);
+                    return;
+                }
                 this.console.log('[ONVIF Server] WS-Discovery listening on 239.255.255.250:3702');
-                resolve();
+                settle();
             });
         });
     }
