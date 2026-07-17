@@ -167,6 +167,7 @@ class DahuaDVRIP {
             this.socket.on('close', () => {
                 this.running = false;
                 this.console.log('[DVRIP] Connection closed');
+                this.rejectAllPending(new Error('DVRIP connection closed'));
             });
             this.socket.connect(this.port, this.host);
         });
@@ -336,26 +337,39 @@ class DahuaDVRIP {
         this.keepaliveInterval = setInterval(() => {
             if (this.running) {
                 this.sendCommand('global.keepAlive', { timeout: 30, active: true })
-                    .catch(err => this.console.error('[DVRIP] Keepalive error:', err.message));
+                    .catch(err => {
+                        this.console.error('[DVRIP] Keepalive failed, closing connection:', err.message);
+                        this.disconnect();
+                    });
             }
         }, 25000);
+    }
+    rejectAllPending(err) {
+        for (const resolver of this.pendingResolvers.values()) {
+            try {
+                resolver.reject(err);
+            }
+            catch (_) { }
+        }
+        this.pendingResolvers.clear();
     }
     async sendCommand(method, params = {}) {
         if (!this.socket || !this.running) {
             throw new Error('Not connected');
         }
         this.requestId++;
+        const id = this.requestId;
         const command = {
             method,
             params,
-            id: this.requestId,
+            id,
             session: this.sessionId
         };
         const jsonData = Buffer.from(JSON.stringify(command), 'latin1');
         const header = Buffer.concat([
             p32(0xf6000000, true),
             p32(jsonData.length),
-            p32(this.requestId),
+            p32(id),
             p32(0),
             p32(jsonData.length),
             p32(0),
@@ -364,10 +378,10 @@ class DahuaDVRIP {
         ]);
         return new Promise((resolve, reject) => {
             const timeout = setTimeout(() => {
-                this.pendingResolvers.delete(this.requestId);
+                this.pendingResolvers.delete(id);
                 reject(new Error(`Command timeout: ${method}`));
             }, 10000);
-            this.pendingResolvers.set(this.requestId, {
+            this.pendingResolvers.set(id, {
                 resolve: (data) => {
                     clearTimeout(timeout);
                     resolve(data);
@@ -377,7 +391,13 @@ class DahuaDVRIP {
                     reject(err);
                 }
             });
-            this.socket.write(Buffer.concat([header, jsonData]));
+            this.socket.write(Buffer.concat([header, jsonData]), (err) => {
+                if (err) {
+                    clearTimeout(timeout);
+                    this.pendingResolvers.delete(id);
+                    reject(err);
+                }
+            });
         });
     }
     async ptzControl(direction, speed = 5, action = 'start') {

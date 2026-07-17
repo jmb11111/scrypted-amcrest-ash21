@@ -169,13 +169,31 @@ class AmcrestASH21Camera extends sdk_1.ScryptedDeviceBase {
     getPtzMoveDuration() {
         return parseInt(this.storage.getItem('ptzMoveDurationMs') || '300');
     }
-    scheduleAutoStop(dvrip, axis, direction, durationMs) {
+    scheduleAutoStop(axis, direction, durationMs) {
         if (this.ptzStopTimers[axis])
             clearTimeout(this.ptzStopTimers[axis]);
         this.ptzStopTimers[axis] = setTimeout(() => {
             this.ptzStopTimers[axis] = null;
-            dvrip.ptzControl(direction, 0, 'stop').catch(() => { });
+            this.ptzSend(direction, 0, 'stop').catch(() => { });
         }, durationMs);
+    }
+    // Send a PTZ command with one automatic reconnect+retry on failure, so a dropped
+    // control connection doesn't lose a start/stop (which makes the camera run to a limit).
+    async ptzSend(direction, speed, action) {
+        let dvrip = await this.ensureDvripConnected();
+        try {
+            return await dvrip.ptzControl(direction, speed, action);
+        }
+        catch (e) {
+            this.console.error(`[PTZ] ${action} ${direction} failed: ${e?.message} — reconnecting + retry`);
+            try {
+                this.dvrip?.disconnect();
+            }
+            catch (_) { }
+            this.dvrip = null;
+            dvrip = await this.ensureDvripConnected();
+            return await dvrip.ptzControl(direction, speed, action);
+        }
     }
     cancelAutoStop(axis) {
         if (this.ptzStopTimers[axis]) {
@@ -184,7 +202,6 @@ class AmcrestASH21Camera extends sdk_1.ScryptedDeviceBase {
         }
     }
     async handleOnvifPtz(command) {
-        const dvrip = await this.ensureDvripConnected();
         const getSpeed = (value) => {
             if (value === undefined || value === 0)
                 return 0;
@@ -196,9 +213,9 @@ class AmcrestASH21Camera extends sdk_1.ScryptedDeviceBase {
             this.cancelAutoStop('tilt');
             this.cancelAutoStop('zoom');
             await Promise.all([
-                dvrip.ptzControl('Left', 0, 'stop').catch(() => { }),
-                dvrip.ptzControl('Up', 0, 'stop').catch(() => { }),
-                dvrip.ptzControl('ZoomIn', 0, 'stop').catch(() => { }),
+                this.ptzSend('Left', 0, 'stop').catch(() => { }),
+                this.ptzSend('Up', 0, 'stop').catch(() => { }),
+                this.ptzSend('ZoomIn', 0, 'stop').catch(() => { }),
             ]);
             return;
         }
@@ -210,17 +227,17 @@ class AmcrestASH21Camera extends sdk_1.ScryptedDeviceBase {
             if (pan !== 0) {
                 const direction = pan > 0 ? 'Right' : 'Left';
                 this.cancelAutoStop('pan');
-                await dvrip.ptzControl(direction, getSpeed(pan), 'start');
+                await this.ptzSend(direction, getSpeed(pan), 'start');
             }
             if (tilt !== 0) {
                 const direction = tilt > 0 ? 'Up' : 'Down';
                 this.cancelAutoStop('tilt');
-                await dvrip.ptzControl(direction, getSpeed(tilt), 'start');
+                await this.ptzSend(direction, getSpeed(tilt), 'start');
             }
             if (zoom !== 0) {
                 const direction = zoom > 0 ? 'ZoomIn' : 'ZoomOut';
                 this.cancelAutoStop('zoom');
-                await dvrip.ptzControl(direction, getSpeed(zoom), 'start');
+                await this.ptzSend(direction, getSpeed(zoom), 'start');
             }
         }
         else if (command.type === 'relative') {
@@ -228,18 +245,18 @@ class AmcrestASH21Camera extends sdk_1.ScryptedDeviceBase {
             const duration = this.getPtzMoveDuration();
             if (pan !== 0) {
                 const direction = pan > 0 ? 'Right' : 'Left';
-                await dvrip.ptzControl(direction, getSpeed(pan), 'start');
-                this.scheduleAutoStop(dvrip, 'pan', direction, duration);
+                await this.ptzSend(direction, getSpeed(pan), 'start');
+                this.scheduleAutoStop('pan', direction, duration);
             }
             if (tilt !== 0) {
                 const direction = tilt > 0 ? 'Up' : 'Down';
-                await dvrip.ptzControl(direction, getSpeed(tilt), 'start');
-                this.scheduleAutoStop(dvrip, 'tilt', direction, duration);
+                await this.ptzSend(direction, getSpeed(tilt), 'start');
+                this.scheduleAutoStop('tilt', direction, duration);
             }
             if (zoom !== 0) {
                 const direction = zoom > 0 ? 'ZoomIn' : 'ZoomOut';
-                await dvrip.ptzControl(direction, getSpeed(zoom), 'start');
-                this.scheduleAutoStop(dvrip, 'zoom', direction, duration);
+                await this.ptzSend(direction, getSpeed(zoom), 'start');
+                this.scheduleAutoStop('zoom', direction, duration);
             }
         }
     }
@@ -370,8 +387,13 @@ class AmcrestASH21Camera extends sdk_1.ScryptedDeviceBase {
                 throw e;
             }
         })();
-        const success = await this.dvripConnecting;
-        this.dvripConnecting = null;
+        let success;
+        try {
+            success = await this.dvripConnecting;
+        }
+        finally {
+            this.dvripConnecting = null;
+        }
         if (!success) {
             throw new Error('DVRIP login failed');
         }
@@ -442,9 +464,7 @@ class AmcrestASH21Camera extends sdk_1.ScryptedDeviceBase {
     }
     // PanTiltZoom interface
     async ptzCommand(command) {
-        const dvrip = await this.ensureDvripConnected();
-        // Map normalized values (-1 to 1) to DVRIP commands
-        // Speed is derived from magnitude
+        // Map normalized values (-1 to 1) to DVRIP commands; speed from magnitude
         const getSpeed = (value) => {
             if (value === undefined)
                 return 0;
@@ -458,20 +478,20 @@ class AmcrestASH21Camera extends sdk_1.ScryptedDeviceBase {
             // Handle pan
             if (pan !== undefined && pan !== 0) {
                 const direction = pan > 0 ? 'Right' : 'Left';
-                await dvrip.ptzControl(direction, getSpeed(pan), 'start');
-                this.scheduleAutoStop(dvrip, 'pan', direction, duration);
+                await this.ptzSend(direction, getSpeed(pan), 'start');
+                this.scheduleAutoStop('pan', direction, duration);
             }
             // Handle tilt
             if (tilt !== undefined && tilt !== 0) {
                 const direction = tilt > 0 ? 'Up' : 'Down';
-                await dvrip.ptzControl(direction, getSpeed(tilt), 'start');
-                this.scheduleAutoStop(dvrip, 'tilt', direction, duration);
+                await this.ptzSend(direction, getSpeed(tilt), 'start');
+                this.scheduleAutoStop('tilt', direction, duration);
             }
             // Handle zoom
             if (zoom !== undefined && zoom !== 0) {
                 const direction = zoom > 0 ? 'ZoomIn' : 'ZoomOut';
-                await dvrip.ptzControl(direction, getSpeed(zoom), 'start');
-                this.scheduleAutoStop(dvrip, 'zoom', direction, duration);
+                await this.ptzSend(direction, getSpeed(zoom), 'start');
+                this.scheduleAutoStop('zoom', direction, duration);
             }
         }
         catch (e) {
