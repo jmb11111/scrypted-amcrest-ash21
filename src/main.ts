@@ -20,6 +20,7 @@ import sdk, {
 import { DahuaDVRIP } from './dvrip';
 import { OnvifServer } from './onvif-server';
 import * as os from 'os';
+import * as crypto from 'crypto';
 
 const { deviceManager, mediaManager } = sdk;
 
@@ -98,6 +99,15 @@ class AmcrestASH21Camera extends ScryptedDeviceBase implements Camera, VideoCame
         return '127.0.0.1';
     }
 
+    private getMacAddress(): string {
+        // Stable, unique, locally-administered MAC derived from the camera host,
+        // so multiple cameras don't collide and the MAC survives restarts.
+        // 0x02 first octet = locally administered, unicast.
+        const hash = crypto.createHash('md5').update(this.getHost()).digest();
+        const octets = [...hash.subarray(0, 5)].map(b => b.toString(16).padStart(2, '0'));
+        return ['02', ...octets].join(':');
+    }
+
     private async startOnvifServer(): Promise<void> {
         if (this.onvifServer) {
             return;
@@ -125,7 +135,7 @@ class AmcrestASH21Camera extends ScryptedDeviceBase implements Camera, VideoCame
                 model: 'ASH21',
                 serialNumber: host.replace(/\./g, ''),
                 hardwareId: 'ASH21-PTZ',
-                macAddress: '00:00:00:00:00:00',
+                macAddress: this.getMacAddress(),
                 ipAddress: onvifIp,
                 console: this.console,
             });
