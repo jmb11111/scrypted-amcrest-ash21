@@ -438,12 +438,6 @@ export class DahuaDVRIP {
         return this.sendCommand(method, params);
     }
 
-    async ptzMove(direction: string, speed: number = 5, durationMs: number = 500): Promise<void> {
-        await this.ptzControl(direction, speed, 'start');
-        await new Promise(resolve => setTimeout(resolve, durationMs));
-        await this.ptzControl(direction, 0, 'stop');
-    }
-
     disconnect(): void {
         this.running = false;
         if (this.keepaliveInterval) {

@@ -18,7 +18,7 @@ import sdk, {
     VideoCamera,
 } from '@scrypted/sdk';
 import { DahuaDVRIP } from './dvrip';
-import { OnvifServer } from './onvif-server';
+import { OnvifServer, PTZCommand } from './onvif-server';
 import * as os from 'os';
 import * as crypto from 'crypto';
 
@@ -148,7 +148,7 @@ class AmcrestASH21Camera extends ScryptedDeviceBase implements Camera, VideoCame
             });
 
             // Listen for PTZ commands from ONVIF and translate to DVRIP
-            this.onvifServer.on('ptz', async (command: any) => {
+            this.onvifServer.on('ptz', async (command: PTZCommand) => {
                 try {
                     await this.handleOnvifPtz(command);
                 } catch (e: any) {
@@ -185,7 +185,7 @@ class AmcrestASH21Camera extends ScryptedDeviceBase implements Camera, VideoCame
         }
     }
 
-    private async handleOnvifPtz(command: any): Promise<void> {
+    private async handleOnvifPtz(command: PTZCommand): Promise<void> {
         if (command.type === 'stop') {
             // Stop all movement; the three axis stops are independent, send in parallel
             this.clearAllAutoStops();
@@ -329,8 +329,9 @@ class AmcrestASH21Camera extends ScryptedDeviceBase implements Camera, VideoCame
             } else {
                 await this.stopOnvifServer();
             }
-        } else if (['onvifPort', 'onvifIp', 'host'].includes(key) && this.isOnvifEnabled()) {
-            // Restart ONVIF server with new settings
+        } else if (['onvifPort', 'onvifIp', 'host', 'username', 'password', 'rtspPort'].includes(key) && this.isOnvifEnabled()) {
+            // Restart ONVIF server with new settings. Credentials and RTSP port
+            // are included because the served stream URI embeds them.
             await this.stopOnvifServer();
             await this.startOnvifServer();
         }
@@ -568,12 +569,19 @@ class AmcrestASH21Provider extends ScryptedDeviceBase implements DeviceProvider,
 
     async putSetting(key: string, value: SettingValue): Promise<void> {
         if (key === 'addCamera' && value) {
-            const ip = String(value);
-            await this.addCamera(ip);
+            const ip = String(value).trim();
+            if (ip) {
+                await this.addCamera(ip);
+            }
         }
     }
 
     private async addCamera(ip: string): Promise<void> {
+        if (!/^[a-zA-Z0-9._-]+$/.test(ip)) {
+            this.console.error(`Invalid camera address "${ip}" - enter an IP address or hostname`);
+            return;
+        }
+
         const nativeId = `amcrest-ash21-${ip.replace(/\./g, '-')}`;
 
         await deviceManager.onDeviceDiscovered({
@@ -593,6 +601,8 @@ class AmcrestASH21Provider extends ScryptedDeviceBase implements DeviceProvider,
         if (device && device.storage) {
             device.storage.setItem('host', ip);
         }
+
+        this.console.log(`Added camera ${ip} as ${nativeId}. Open the new device to set credentials and enable the ONVIF server.`);
     }
 
     async getDevice(nativeId: string): Promise<AmcrestASH21Camera> {

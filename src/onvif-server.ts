@@ -15,10 +15,14 @@ export interface OnvifServerConfig {
     console?: Console;
 }
 
+export type PTZCommandType = 'continuous' | 'relative' | 'absolute' | 'stop' | 'preset' | 'home';
+
 export interface PTZCommand {
+    type?: PTZCommandType;
     pan?: number;
     tilt?: number;
     zoom?: number;
+    preset?: string;
 }
 
 export class OnvifServer extends EventEmitter {
@@ -696,17 +700,19 @@ export class OnvifServer extends EventEmitter {
     private extractPTZVelocity(body: string): PTZCommand {
         const result: PTZCommand = {};
 
-        // Extract PanTilt velocity
-        const panTiltMatch = body.match(/PanTilt[^>]*x="([^"]*)"[^>]*y="([^"]*)"/i);
-        if (panTiltMatch) {
-            result.pan = parseFloat(panTiltMatch[1]) || 0;
-            result.tilt = parseFloat(panTiltMatch[2]) || 0;
+        // Match x/y independently so attribute order doesn't matter
+        const panTiltTag = body.match(/<[^>]*PanTilt[^>]*>/i)?.[0];
+        if (panTiltTag) {
+            const x = panTiltTag.match(/x="([^"]*)"/i);
+            const y = panTiltTag.match(/y="([^"]*)"/i);
+            if (x) result.pan = parseFloat(x[1]) || 0;
+            if (y) result.tilt = parseFloat(y[1]) || 0;
         }
 
-        // Extract Zoom velocity
-        const zoomMatch = body.match(/Zoom[^>]*x="([^"]*)"/i);
-        if (zoomMatch) {
-            result.zoom = parseFloat(zoomMatch[1]) || 0;
+        const zoomTag = body.match(/<[^>]*Zoom[^>]*>/i)?.[0];
+        if (zoomTag) {
+            const x = zoomTag.match(/x="([^"]*)"/i);
+            if (x) result.zoom = parseFloat(x[1]) || 0;
         }
 
         return result;
@@ -753,7 +759,8 @@ export class OnvifServer extends EventEmitter {
                 const message = msg.toString();
                 if (message.includes('Probe') && message.includes('NetworkVideoTransmitter')) {
                     this.console.log(`[ONVIF Server] Discovery probe from ${rinfo.address}:${rinfo.port}`);
-                    this.sendProbeMatch(rinfo.address, rinfo.port);
+                    const midMatch = message.match(/MessageID[^>]*>\s*([^<\s]+)\s*</i);
+                    this.sendProbeMatch(rinfo.address, rinfo.port, midMatch?.[1]);
                 }
             });
 
@@ -770,9 +777,13 @@ export class OnvifServer extends EventEmitter {
         });
     }
 
-    private sendProbeMatch(address: string, port: number): void {
+    private sendProbeMatch(address: string, port: number, relatesTo?: string): void {
         const messageId = `urn:uuid:${this.generateUUID()}`;
         const baseUrl = `http://${this.config.ipAddress}:${this.config.httpPort}`;
+        // Strict WS-Discovery clients ignore a ProbeMatch that doesn't relate
+        // back to their Probe's MessageID
+        const relatesToXml = relatesTo ? `
+        <wsa:RelatesTo>${relatesTo}</wsa:RelatesTo>` : '';
 
         const response = `<?xml version="1.0" encoding="UTF-8"?>
 <soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
@@ -780,7 +791,7 @@ export class OnvifServer extends EventEmitter {
                xmlns:wsd="http://schemas.xmlsoap.org/ws/2005/04/discovery"
                xmlns:dn="http://www.onvif.org/ver10/network/wsdl">
     <soap:Header>
-        <wsa:MessageID>${messageId}</wsa:MessageID>
+        <wsa:MessageID>${messageId}</wsa:MessageID>${relatesToXml}
         <wsa:To>http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</wsa:To>
         <wsa:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/ProbeMatches</wsa:Action>
     </soap:Header>
