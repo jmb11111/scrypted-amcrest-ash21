@@ -150,7 +150,18 @@ class AmcrestASH21Camera extends sdk_1.ScryptedDeviceBase {
                     this.console.error('[ONVIF] PTZ command error:', e.message);
                 }
             });
-            await this.onvifServer.start();
+            try {
+                await this.onvifServer.start();
+            }
+            catch (e) {
+                // Don't leave a dead server object around, or a retry no-ops forever.
+                try {
+                    await this.onvifServer.stop();
+                }
+                catch (_) { }
+                this.onvifServer = null;
+                throw e;
+            }
             this.console.log(`[ONVIF] Server started at http://${onvifIp}:${onvifPort}/onvif/device_service`);
         })();
         try {

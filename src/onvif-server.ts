@@ -89,11 +89,20 @@ class OnvifServer extends events_1.EventEmitter {
         }
         this.pullWaiters = [];
         if (this.httpServer) {
-            this.httpServer.close();
+            // Destroy keep-alive sockets and await close so a quick restart doesn't EADDRINUSE.
+            try {
+                this.httpServer.closeAllConnections?.();
+            }
+            catch (_) { }
+            const server = this.httpServer;
             this.httpServer = null;
+            await new Promise((resolve) => server.close(() => resolve()));
         }
         if (this.discoverySocket) {
-            this.discoverySocket.close();
+            try {
+                this.discoverySocket.close();
+            }
+            catch (_) { }
             this.discoverySocket = null;
         }
         this.console.log('[ONVIF Server] Stopped');
@@ -784,16 +793,23 @@ class OnvifServer extends events_1.EventEmitter {
     // ── WS-Discovery ─────────────────────────────────────────────────────────
     async startDiscovery() {
         return new Promise((resolve) => {
+            // Discovery is best-effort: never block (or hang) server startup on it.
+            let settled = false;
+            const done = () => { if (!settled) { settled = true; resolve(); } };
             this.discoverySocket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
             this.discoverySocket.on('error', (err) => {
                 if (err.code === 'EADDRINUSE') {
                     this.console.log('[ONVIF Server] WS-Discovery port 3702 already in use (another camera has it)');
-                    this.discoverySocket?.close();
-                    this.discoverySocket = null;
                 }
                 else {
                     this.console.error('[ONVIF Server] Discovery error:', err.message);
                 }
+                try {
+                    this.discoverySocket?.close();
+                }
+                catch (_) { }
+                this.discoverySocket = null;
+                done();
             });
             this.discoverySocket.on('message', (msg, rinfo) => {
                 const message = msg.toString();
@@ -809,7 +825,7 @@ class OnvifServer extends events_1.EventEmitter {
                 catch (e) {
                     this.console.log('[ONVIF Server] Could not join multicast group:', e.message);
                 }
-                resolve();
+                done();
             });
         });
     }
