@@ -400,6 +400,35 @@ class DahuaDVRIP {
             });
         });
     }
+    // Fire-and-forget: resolve as soon as the command is written to the socket,
+    // without waiting for the camera's response. Used for PTZ so moves feel instant.
+    fireCommand(method, params = {}) {
+        if (!this.socket || !this.running) {
+            return Promise.reject(new Error('Not connected'));
+        }
+        this.requestId++;
+        const id = this.requestId;
+        const command = { method, params, id, session: this.sessionId };
+        const jsonData = Buffer.from(JSON.stringify(command), 'latin1');
+        const header = Buffer.concat([
+            p32(0xf6000000, true),
+            p32(jsonData.length),
+            p32(id),
+            p32(0),
+            p32(jsonData.length),
+            p32(0),
+            p32(this.sessionId),
+            p32(0)
+        ]);
+        return new Promise((resolve, reject) => {
+            this.socket.write(Buffer.concat([header, jsonData]), (err) => {
+                if (err)
+                    reject(err);
+                else
+                    resolve();
+            });
+        });
+    }
     async ptzControl(direction, speed = 5, action = 'start') {
         const params = {
             channel: 0,
@@ -410,7 +439,8 @@ class DahuaDVRIP {
             arg4: 0
         };
         const method = action === 'start' ? 'ptz.start' : 'ptz.stop';
-        return this.sendCommand(method, params);
+        // Fire-and-forget for low PTZ latency; ptzSend() handles reconnect+retry.
+        return this.fireCommand(method, params);
     }
     async ptzMove(direction, speed = 5, durationMs = 500) {
         await this.ptzControl(direction, speed, 'start');

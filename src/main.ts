@@ -522,6 +522,18 @@ class AmcrestASH21Provider extends sdk_1.ScryptedDeviceBase {
             await this.addCamera(ip);
         }
     }
+    getNextOnvifPort() {
+        const used = new Set();
+        for (const cam of this.cameras.values()) {
+            const p = parseInt(cam.storage?.getItem('onvifPort') || '0');
+            if (p)
+                used.add(p);
+        }
+        let port = 8483;
+        while (used.has(port))
+            port++;
+        return port;
+    }
     async addCamera(ip) {
         const nativeId = `amcrest-ash21-${ip.replace(/\./g, '-')}`;
         await deviceManager.onDeviceDiscovered({
@@ -539,6 +551,11 @@ class AmcrestASH21Provider extends sdk_1.ScryptedDeviceBase {
         const device = await this.getDevice(nativeId);
         if (device && device.storage) {
             device.storage.setItem('host', ip);
+            // Enable ONVIF by default on a free port, so PTZ works out of the box and a
+            // second camera doesn't silently stay off (the onvifEnabled gotcha).
+            device.storage.setItem('onvifEnabled', 'true');
+            device.storage.setItem('onvifPort', String(this.getNextOnvifPort()));
+            await device.initOnvifServer();
         }
     }
     async getDevice(nativeId) {

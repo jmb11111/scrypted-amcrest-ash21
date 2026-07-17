@@ -129,13 +129,21 @@ class OnvifServer extends events_1.EventEmitter {
             if (!urlMatch)
                 throw new Error('No subscription URL in response');
             this.nativeSubscriptionUrl = urlMatch[1].trim();
+            this.nativeProxyFailures = 0;
             this.console.log('[ONVIF Events] Subscribed to native camera:', this.nativeSubscriptionUrl);
             while (this.running) {
                 await this.pollNativeEvents(username, password);
             }
         }
         catch (e) {
-            this.console.error('[ONVIF Events] Proxy error:', e.message, '— retrying in 30s');
+            this.nativeProxyFailures = (this.nativeProxyFailures || 0) + 1;
+            if (this.nativeProxyFailures >= 5) {
+                this.console.warn(`[ONVIF Events] Camera does not appear to support ONVIF events (${e.message}); disabling event proxy after ${this.nativeProxyFailures} attempts.`);
+                this.nativeProxyRunning = false;
+                this.nativeSubscriptionUrl = null;
+                return;
+            }
+            this.console.error('[ONVIF Events] Proxy error:', e.message, `— retry ${this.nativeProxyFailures}/5 in 30s`);
         }
         this.nativeSubscriptionUrl = null;
         if (this.running) {
