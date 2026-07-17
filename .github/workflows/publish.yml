@@ -1,0 +1,49 @@
+name: Publish to npm
+
+# Publishes to npm via Trusted Publishing (OIDC) — no tokens/secrets required.
+# Trigger by pushing a version tag, e.g.:
+#   git tag v1.1.0-beta.0 && git push origin v1.1.0-beta.0   -> published under the "beta" dist-tag
+#   git tag v1.1.0        && git push origin v1.1.0           -> published under "latest"
+# The dist-tag is chosen from the version in package.json: a prerelease (contains "-") goes to beta.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch: {}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write        # required for npm Trusted Publishing (OIDC)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+
+      # Trusted Publishing requires npm >= 11.5.1; the runner's bundled npm may be older.
+      - name: Update npm
+        run: npm install -g npm@latest
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Determine dist-tag from package version
+        id: disttag
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          if [[ "$VERSION" == *-* ]]; then TAG=beta; else TAG=latest; fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Publishing $VERSION under dist-tag: $TAG"
+
+      - name: Publish
+        run: npm publish --tag "${{ steps.disttag.outputs.tag }}"
