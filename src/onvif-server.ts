@@ -62,12 +62,20 @@ export class OnvifServer extends EventEmitter {
         this.running = false;
 
         if (this.httpServer) {
-            this.httpServer.close();
+            const server = this.httpServer;
             this.httpServer = null;
+            // Destroy keep-alive connections and wait for close, otherwise a
+            // quick stop/start on a settings change can hit EADDRINUSE.
+            server.closeAllConnections();
+            await new Promise<void>((resolve) => server.close(() => resolve()));
         }
 
         if (this.discoverySocket) {
-            this.discoverySocket.close();
+            try {
+                this.discoverySocket.close();
+            } catch (e) {
+                // Socket may already be closed
+            }
             this.discoverySocket = null;
         }
 
@@ -142,9 +150,10 @@ export class OnvifServer extends EventEmitter {
             return this.handleGetSnapshotUri();
         } else if (action.includes('GetNodes') || action.includes('GetNode')) {
             return this.handleGetNodes();
-        } else if (action.includes('GetConfigurations') && action.includes('PTZ')) {
+        } else if (action.includes('GetConfigurations')) {
+            // PTZ GetConfigurations (only PTZ has this action among served services)
             return this.handleGetPTZConfigurations();
-        } else if (action.includes('GetConfiguration') && action.includes('PTZ')) {
+        } else if (action.includes('GetConfiguration')) {
             return this.handleGetPTZConfiguration();
         } else if (action.includes('GetStatus')) {
             return this.handleGetPTZStatus();
@@ -177,8 +186,10 @@ export class OnvifServer extends EventEmitter {
         } else if (action.includes('GetNetworkInterfaces')) {
             return this.handleGetNetworkInterfaces();
         } else {
-            this.console.log(`[ONVIF Server] Unhandled action: ${action}`);
-            return this.handleGetCapabilities(); // Default response
+            // A SOAP fault is far easier to debug client-side than a
+            // well-formed-but-wrong default response.
+            this.console.log(`[ONVIF Server] Unsupported action: ${action}`);
+            throw new Error(`Unsupported ONVIF action: ${action}`);
         }
     }
 

@@ -87,7 +87,7 @@ class AmcrestASH21Camera extends ScryptedDeviceBase implements Camera, VideoCame
     }
 
     private getOnvifPort(): number {
-        return parseInt(this.storage.getItem('onvifPort') || '8080');
+        return parseInt(this.storage.getItem('onvifPort') || '8483');
     }
 
     private getOnvifIp(): string {
@@ -298,7 +298,7 @@ class AmcrestASH21Camera extends ScryptedDeviceBase implements Camera, VideoCame
                 description: this.isOnvifEnabled() ? `ONVIF URL: ${onvifUrl}` : 'Enable ONVIF server to see URL',
                 value: onvifPort.toString(),
                 type: 'number',
-                placeholder: '8080',
+                placeholder: '8483',
             },
             {
                 key: 'onvifIp',
