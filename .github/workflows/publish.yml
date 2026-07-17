@@ -33,8 +33,8 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build
-        run: npm run build
+      # Note: the production build runs via the package's prepublishOnly hook
+      # during `npm publish` (NODE_ENV=production -> dist/, plus sdk.json).
 
       - name: Determine dist-tag from package version
         id: disttag
