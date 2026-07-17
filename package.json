@@ -1,6 +1,6 @@
 {
   "name": "scrypted-amcrest-ash21",
-  "version": "1.0.6",
+  "version": "1.2.0-beta.1",
   "description": "Amcrest ASH21 PTZ Camera Plugin for Scrypted - Full PTZ control via DVRIP protocol",
   "author": "Joshua Blasbalg",
   "license": "MIT",
@@ -32,7 +32,7 @@
     "scrypted-deploy": "scrypted-deploy",
     "scrypted-debug": "scrypted-debug",
     "deploy": "npm run build && npm run scrypted-deploy",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "NODE_ENV=production scrypted-webpack && unzip -p dist/plugin.zip sdk.json > dist/sdk.json"
   },
   "scrypted": {
     "name": "Amcrest ASH21 PTZ",

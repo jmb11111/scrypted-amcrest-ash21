@@ -1,5 +1,6 @@
 import * as http from 'http';
 import * as dgram from 'dgram';
+import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
 
 export interface OnvifServerConfig {
@@ -12,7 +13,22 @@ export interface OnvifServerConfig {
     hardwareId: string;
     macAddress: string;
     ipAddress: string;
+    // Native camera event proxy (optional): subscribe to the camera's own ONVIF
+    // events and re-serve them via this server's PullPoint endpoint.
+    nativeCameraHost?: string;
+    nativeCameraUsername?: string;
+    nativeCameraPassword?: string;
     console?: Console;
+}
+
+interface ProxiedEvent {
+    xml: string;
+    timestamp: Date;
+}
+
+interface PullWaiter {
+    resolve: (events: ProxiedEvent[]) => void;
+    timer: NodeJS.Timeout;
 }
 
 export interface PTZCommand {
@@ -27,6 +43,13 @@ export class OnvifServer extends EventEmitter {
     private discoverySocket: dgram.Socket | null = null;
     private console: Console;
     private running: boolean = false;
+
+    // Native camera event proxy state
+    private pendingEvents: ProxiedEvent[] = [];
+    private pullWaiters: PullWaiter[] = [];
+    private nativeSubscriptionUrl: string | null = null;
+    private nativeProxyRunning: boolean = false;
+    private nativeRetryTimer: NodeJS.Timeout | null = null;
 
     // ONVIF namespaces
     private readonly NS = {
@@ -56,10 +79,25 @@ export class OnvifServer extends EventEmitter {
 
         this.running = true;
         this.console.log(`[ONVIF Server] Started on port ${this.config.httpPort}`);
+
+        if (this.config.nativeCameraHost) {
+            this.startNativeEventProxy();
+        }
     }
 
     async stop(): Promise<void> {
         this.running = false;
+        this.nativeProxyRunning = false;
+
+        if (this.nativeRetryTimer) {
+            clearTimeout(this.nativeRetryTimer);
+            this.nativeRetryTimer = null;
+        }
+        for (const waiter of this.pullWaiters) {
+            clearTimeout(waiter.timer);
+            waiter.resolve([]);
+        }
+        this.pullWaiters = [];
 
         if (this.httpServer) {
             this.httpServer.close();
@@ -72,6 +110,220 @@ export class OnvifServer extends EventEmitter {
         }
 
         this.console.log('[ONVIF Server] Stopped');
+    }
+
+    // ── Native camera event proxy ────────────────────────────────────────────
+    // Subscribes to the Amcrest camera's own ONVIF event service and re-serves
+    // those events on this server's PullPoint endpoint (consumed by Frigate).
+    private startNativeEventProxy(): void {
+        if (this.nativeProxyRunning) return;
+        this.nativeProxyRunning = true;
+        this.nativeEventProxyLoop();
+    }
+
+    private async nativeEventProxyLoop(): Promise<void> {
+        if (!this.running || !this.config.nativeCameraHost) return;
+        const host = this.config.nativeCameraHost;
+        const username = this.config.nativeCameraUsername || 'admin';
+        const password = this.config.nativeCameraPassword || '';
+        try {
+            const subscribeBody = `<?xml version="1.0" encoding="UTF-8"?>
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+            xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing">
+  <s:Header>
+    <wsa:Action>http://www.onvif.org/ver10/events/wsdl/EventPortType/CreatePullPointSubscriptionRequest</wsa:Action>
+  </s:Header>
+  <s:Body>
+    <CreatePullPointSubscription xmlns="http://www.onvif.org/ver10/events/wsdl">
+      <InitialTerminationTime>PT1H</InitialTerminationTime>
+    </CreatePullPointSubscription>
+  </s:Body>
+</s:Envelope>`;
+            const response = await this.httpDigestPost(`http://${host}/onvif/event_service`, username, password, subscribeBody);
+            const urlMatch = response.match(/<(?:[^:>]+:)?Address[^>]*>\s*(http[^<\s]+)\s*<\/(?:[^:>]+:)?Address>/);
+            if (!urlMatch) throw new Error('No subscription URL in response');
+            this.nativeSubscriptionUrl = urlMatch[1].trim();
+            this.console.log('[ONVIF Events] Subscribed to native camera:', this.nativeSubscriptionUrl);
+            while (this.running) {
+                await this.pollNativeEvents(username, password);
+            }
+        } catch (e: any) {
+            this.console.error('[ONVIF Events] Proxy error:', e?.message, '— retrying in 30s');
+        }
+        this.nativeSubscriptionUrl = null;
+        if (this.running) {
+            this.nativeRetryTimer = setTimeout(() => {
+                this.nativeRetryTimer = null;
+                this.nativeEventProxyLoop();
+            }, 30000);
+        }
+    }
+
+    private async pollNativeEvents(username: string, password: string): Promise<void> {
+        if (!this.nativeSubscriptionUrl) return;
+        const pollBody = `<?xml version="1.0" encoding="UTF-8"?>
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">
+  <s:Body>
+    <PullMessages xmlns="http://www.onvif.org/ver10/events/wsdl">
+      <Timeout>PT30S</Timeout>
+      <MessageLimit>100</MessageLimit>
+    </PullMessages>
+  </s:Body>
+</s:Envelope>`;
+        const response = await this.httpDigestPost(this.nativeSubscriptionUrl, username, password, pollBody, 35000);
+        const notifications = response.match(/<(?:[^:>]+:)?NotificationMessage[\s\S]*?<\/(?:[^:>]+:)?NotificationMessage>/g) || [];
+        for (const xml of notifications) {
+            this.queueEvent({ xml, timestamp: new Date() });
+        }
+    }
+
+    private queueEvent(event: ProxiedEvent): void {
+        this.pendingEvents.push(event);
+        // Deliver to any waiting PullMessages requests
+        while (this.pullWaiters.length > 0 && this.pendingEvents.length > 0) {
+            const waiter = this.pullWaiters.shift()!;
+            clearTimeout(waiter.timer);
+            waiter.resolve(this.pendingEvents.splice(0));
+        }
+        // Bound queue size
+        if (this.pendingEvents.length > 100) {
+            this.pendingEvents.splice(0, this.pendingEvents.length - 100);
+        }
+    }
+
+    // ── HTTP Digest auth helper ──────────────────────────────────────────────
+    private async httpDigestPost(url: string, username: string, password: string, body: string, timeoutMs = 10000): Promise<string> {
+        const first = await this.httpPost(url, body, undefined, timeoutMs);
+        if (first.status === 200) return first.body;
+        if (first.status !== 401) throw new Error(`HTTP ${first.status} from ${url}`);
+        const authHeader = (first.headers['www-authenticate'] as string) || '';
+        const realm = authHeader.match(/realm="([^"]+)"/)?.[1];
+        const nonce = authHeader.match(/nonce="([^"]+)"/)?.[1];
+        const qop = authHeader.match(/qop="([^"]+)"/)?.[1];
+        const opaque = authHeader.match(/opaque="([^"]+)"/)?.[1];
+        if (!realm || !nonce) throw new Error(`Invalid WWW-Authenticate: ${authHeader}`);
+        const parsedUrl = new URL(url);
+        const uri = parsedUrl.pathname + parsedUrl.search;
+        const nc = '00000001';
+        const cnonce = crypto.randomBytes(4).toString('hex');
+        const ha1 = crypto.createHash('md5').update(`${username}:${realm}:${password}`).digest('hex');
+        const ha2 = crypto.createHash('md5').update(`POST:${uri}`).digest('hex');
+        let digestResp: string;
+        if (qop === 'auth' || qop === 'auth,auth-int') {
+            digestResp = crypto.createHash('md5').update(`${ha1}:${nonce}:${nc}:${cnonce}:auth:${ha2}`).digest('hex');
+        } else {
+            digestResp = crypto.createHash('md5').update(`${ha1}:${nonce}:${ha2}`).digest('hex');
+        }
+        let authValue = `Digest username="${username}", realm="${realm}", nonce="${nonce}", uri="${uri}", response="${digestResp}"`;
+        if (qop) authValue += `, qop=auth, nc=${nc}, cnonce="${cnonce}"`;
+        if (opaque) authValue += `, opaque="${opaque}"`;
+        const second = await this.httpPost(url, body, authValue, timeoutMs);
+        if (second.status !== 200) throw new Error(`HTTP ${second.status} after digest auth`);
+        return second.body;
+    }
+
+    private httpPost(url: string, body: string, authorizationHeader?: string, timeoutMs = 10000): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }> {
+        return new Promise((resolve, reject) => {
+            const parsedUrl = new URL(url);
+            const options: http.RequestOptions = {
+                hostname: parsedUrl.hostname,
+                port: parseInt(parsedUrl.port) || 80,
+                path: parsedUrl.pathname + parsedUrl.search,
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/soap+xml; charset=utf-8',
+                    'Content-Length': Buffer.byteLength(body),
+                    ...(authorizationHeader ? { Authorization: authorizationHeader } : {}),
+                },
+                timeout: timeoutMs,
+            };
+            const req = http.request(options, (res) => {
+                let data = '';
+                res.on('data', chunk => (data += chunk));
+                res.on('end', () => resolve({
+                    status: res.statusCode || 0,
+                    headers: res.headers,
+                    body: data,
+                }));
+            });
+            req.on('error', reject);
+            req.on('timeout', () => {
+                req.destroy();
+                reject(new Error(`HTTP timeout after ${timeoutMs}ms: ${url}`));
+            });
+            req.write(body);
+            req.end();
+        });
+    }
+
+    // ── Event service handlers (served to Frigate/HomeKit) ───────────────────
+    private handleGetEventProperties(): string {
+        return this.wrapSoapResponse(`
+            <tev:GetEventPropertiesResponse xmlns:tev="http://www.onvif.org/ver10/events/wsdl">
+                <tev:TopicNamespaceLocation>http://www.onvif.org/onvif/ver10/topicns/topicns.xml</tev:TopicNamespaceLocation>
+                <tev:FixedTopicSet>false</tev:FixedTopicSet>
+                <tev:TopicSet/>
+            </tev:GetEventPropertiesResponse>`);
+    }
+
+    private handleCreatePullPointSubscription(): string {
+        const baseUrl = `http://${this.config.ipAddress}:${this.config.httpPort}`;
+        const termTime = new Date(Date.now() + 3600000).toISOString();
+        return this.wrapSoapResponse(`
+            <tev:CreatePullPointSubscriptionResponse
+                xmlns:tev="http://www.onvif.org/ver10/events/wsdl"
+                xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2"
+                xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing">
+                <tev:SubscriptionReference>
+                    <wsa:Address>${baseUrl}/onvif/pullpoint</wsa:Address>
+                </tev:SubscriptionReference>
+                <tev:CurrentTime>${new Date().toISOString()}</tev:CurrentTime>
+                <tev:TerminationTime>${termTime}</tev:TerminationTime>
+            </tev:CreatePullPointSubscriptionResponse>`);
+    }
+
+    private handlePullMessages(body: string): Promise<string> {
+        const timeoutMatch = body.match(/<[^:>]*:?Timeout[^>]*>PT(\d+)S/);
+        const timeoutSec = Math.min(timeoutMatch ? parseInt(timeoutMatch[1]) : 10, 60);
+        return new Promise((resolve) => {
+            if (this.pendingEvents.length > 0) {
+                resolve(this.buildPullMessagesResponse(this.pendingEvents.splice(0)));
+                return;
+            }
+            const timer = setTimeout(() => {
+                const idx = this.pullWaiters.findIndex(w => w.timer === timer);
+                if (idx >= 0) this.pullWaiters.splice(idx, 1);
+                resolve(this.buildPullMessagesResponse([]));
+            }, timeoutSec * 1000);
+            this.pullWaiters.push({ resolve: (events) => resolve(this.buildPullMessagesResponse(events)), timer });
+        });
+    }
+
+    private buildPullMessagesResponse(events: ProxiedEvent[]): string {
+        const now = new Date().toISOString();
+        const termTime = new Date(Date.now() + 3600000).toISOString();
+        const messages = events.map(e => `<wsnt:NotificationMessage>${e.xml}</wsnt:NotificationMessage>`).join('\n');
+        return this.wrapSoapResponse(`
+            <tev:PullMessagesResponse
+                xmlns:tev="http://www.onvif.org/ver10/events/wsdl"
+                xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2">
+                <tev:CurrentTime>${now}</tev:CurrentTime>
+                <tev:TerminationTime>${termTime}</tev:TerminationTime>
+                ${messages}
+            </tev:PullMessagesResponse>`);
+    }
+
+    private handleRenew(): string {
+        const termTime = new Date(Date.now() + 3600000).toISOString();
+        return this.wrapSoapResponse(`
+            <wsnt:RenewResponse xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2">
+                <wsnt:TerminationTime>${termTime}</wsnt:TerminationTime>
+                <wsnt:CurrentTime>${new Date().toISOString()}</wsnt:CurrentTime>
+            </wsnt:RenewResponse>`);
+    }
+
+    private handleUnsubscribe(): string {
+        return this.wrapSoapResponse(`<wsnt:UnsubscribeResponse xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2"/>`);
     }
 
     private async startHttpServer(): Promise<void> {
@@ -176,6 +428,16 @@ export class OnvifServer extends EventEmitter {
             return this.handleGetVideoSources();
         } else if (action.includes('GetNetworkInterfaces')) {
             return this.handleGetNetworkInterfaces();
+        } else if (action.includes('GetEventProperties')) {
+            return this.handleGetEventProperties();
+        } else if (action.includes('CreatePullPointSubscription')) {
+            return this.handleCreatePullPointSubscription();
+        } else if (action.includes('PullMessages')) {
+            return this.handlePullMessages(body);
+        } else if (action.includes('Renew')) {
+            return this.handleRenew();
+        } else if (action.includes('Unsubscribe')) {
+            return this.handleUnsubscribe();
         } else {
             this.console.log(`[ONVIF Server] Unhandled action: ${action}`);
             return this.handleGetCapabilities(); // Default response

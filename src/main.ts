@@ -127,6 +127,10 @@ class AmcrestASH21Camera extends ScryptedDeviceBase implements Camera, VideoCame
                 hardwareId: 'ASH21-PTZ',
                 macAddress: '00:00:00:00:00:00',
                 ipAddress: onvifIp,
+                // Proxy the camera's own ONVIF events out through this server
+                nativeCameraHost: host,
+                nativeCameraUsername: this.getUsername(),
+                nativeCameraPassword: this.getPassword(),
                 console: this.console,
             });
 
