@@ -38,6 +38,7 @@ const sdk_1 = __importStar(require("@scrypted/sdk"));
 const dvrip_1 = require("./dvrip");
 const onvif_server_1 = require("./onvif-server");
 const os = __importStar(require("os"));
+const crypto = __importStar(require("crypto"));
 const { deviceManager, mediaManager } = sdk_1.default;
 class AmcrestASH21Camera extends sdk_1.ScryptedDeviceBase {
     constructor(nativeId) {
@@ -102,6 +103,13 @@ class AmcrestASH21Camera extends sdk_1.ScryptedDeviceBase {
         }
         return '127.0.0.1';
     }
+    getMacAddress() {
+        // Stable, unique, locally-administered MAC derived from the camera host so
+        // multiple cameras don't collide on ONVIF/HomeKit (was 00:00:00:00:00:00).
+        const seed = this.getHost() || this.nativeId || 'ash21';
+        const h = crypto.createHash('md5').update(seed).digest('hex');
+        return `02:${h.substr(0, 2)}:${h.substr(2, 2)}:${h.substr(4, 2)}:${h.substr(6, 2)}:${h.substr(8, 2)}`;
+    }
     async startOnvifServer() {
         if (this.onvifServer) {
             return;
@@ -125,7 +133,7 @@ class AmcrestASH21Camera extends sdk_1.ScryptedDeviceBase {
                 model: 'ASH21',
                 serialNumber: host.replace(/\./g, ''),
                 hardwareId: 'ASH21-PTZ',
-                macAddress: '00:00:00:00:00:00',
+                macAddress: this.getMacAddress(),
                 ipAddress: onvifIp,
                 nativeCameraHost: host,
                 nativeCameraUsername: this.getUsername(),
