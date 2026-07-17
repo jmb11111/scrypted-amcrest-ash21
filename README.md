@@ -1,98 +1,72 @@
 # Scrypted Amcrest ASH21 PTZ Plugin
 
-Full PTZ (Pan-Tilt-Zoom) control for Amcrest ASH21-B-V2 cameras in Scrypted using the DVRIP protocol.
+Full PTZ control for **Amcrest ASH21** cameras in [Scrypted](https://scrypted.app),
+via the Dahua **DVRIP** protocol, plus a built-in **ONVIF server** so NVRs like
+**Frigate** can drive PTZ. Also proxies the camera's native ONVIF events.
 
-## Features
+## Install
 
-- Full PTZ control (pan, tilt, zoom)
-- Works with Frigate NVR via built-in ONVIF server
-- Video streaming via Scrypted Rebroadcast
-- HomeKit compatible
+In Scrypted: **Install Scrypted Plugin → `scrypted-amcrest-ash21`**. Updates land
+through the normal **Update** button (published to npm via GitHub Actions).
 
-## Installation
+## Add a camera
 
-### Method 1: Scrypted UI (if working)
-1. Go to Scrypted web interface
-2. Click "Install Plugin"
-3. Search for `scrypted-amcrest-ash21`
-4. Click Install
+Open the plugin → add the camera's IP. On add, the plugin automatically:
 
-### Method 2: Manual Installation
-If the UI install fails, use manual installation:
+- enables the **ONVIF server** (`ONVIF Enabled` = on), and
+- assigns the **next free ONVIF port** starting at **8483** (so a second camera
+  gets 8484, etc. — no manual port juggling, no silent collisions).
 
-```bash
-# SSH into your Scrypted server
-ssh user@your-server
+Then set the camera's **username/password** in its settings. Default DVRIP port is
+`37777`, RTSP `554`.
 
-# Download and install the plugin
-docker exec -it scrypted sh -c "
-  cd /tmp && \
-  npm pack scrypted-amcrest-ash21 && \
-  mkdir -p /server/volume/plugins/scrypted-amcrest-ash21 && \
-  tar -xzf scrypted-amcrest-ash21-*.tgz && \
-  cp -r package/* /server/volume/plugins/scrypted-amcrest-ash21/ && \
-  rm -rf package scrypted-amcrest-ash21-*.tgz
-"
+### Multiple cameras
 
-# Restart Scrypted
-docker restart scrypted
-```
+Each camera runs its own ONVIF server on its own port (8483, 8484, …) and gets a
+unique, stable MAC derived from its IP, so they don't collide on ONVIF/HomeKit.
 
-## Camera Setup
+## Frigate PTZ
 
-**Important:** The ASH21-B-V2 does not have a web interface for configuration. All camera settings must be done through the Amcrest mobile app.
-
-### Initial Setup
-
-1. **Connect via Ethernet first** - Plug the camera into your network via ethernet cable
-2. **Download Amcrest View Pro** app (iOS/Android)
-3. **Add the camera** in the app and complete initial setup
-4. **Configure WiFi** (if desired) through the app settings
-5. **Note the camera's IP address** from your router or the app
-
-### Camera Settings (via Amcrest App)
-
-You may need to fine-tune these settings in the Amcrest app for optimal performance:
-
-- **Video Settings**:
-  - Main Stream: H.264, 1080P, 30fps recommended
-  - Sub Stream: H.264, VGA (640x480), 30fps recommended for detection
-- **I-Frame Interval**: Set to 1 second (30 frames) for lower latency
-- **Network Settings**: Ensure RTSP is enabled
-
-## Plugin Configuration
-
-1. After installation, go to the plugin settings in Scrypted
-2. Enter your camera details:
-   - **IP Address**: Your camera's IP (e.g., 10.10.10.68)
-   - **Username**: Camera username (default: admin)
-   - **Password**: Camera password
-   - **ONVIF Port**: Port for ONVIF server (default: 8483)
-
-## Frigate Integration
-
-This plugin includes a built-in ONVIF server for PTZ control from Frigate:
+Point each camera's `onvif` block at that camera's ONVIF port on the Scrypted host:
 
 ```yaml
-# frigate config.yml
 cameras:
-  amcrest_ash21:
+  office:
     onvif:
-      host: YOUR_SCRYPTED_IP
-      port: 8483
+      host: 10.10.10.185   # the Scrypted host
+      port: 8483           # this camera's ONVIF port
       user: admin
-      password: ""
+      password: your_password
 ```
 
-## Supported Cameras
+## Recommended: let your NVR own the video
 
-- Amcrest ASH21-B-V2
-- May work with other Amcrest/Dahua cameras using DVRIP protocol
+If **Frigate** (or another NVR) already pulls video from the camera, turn **off**
+Scrypted's **Prebuffer** for these cameras (camera → **Stream Management /
+Rebroadcast → Prebuffer: off**). The ASH21 is a budget Wi‑Fi camera with a small
+limit on simultaneous RTSP connections; letting Scrypted prebuffer *and* your NVR
+pull at the same time starves the stream (Frigate "no frames"). This plugin's job
+here is PTZ — let the NVR handle video.
+
+## Settings
+
+- **PTZ Move Duration (ms)** (`ptzMoveDurationMs`, default `300`) — how long a
+  relative "nudge" moves before auto-stopping.
+- PTZ commands are fire-and-forget with automatic reconnect+retry, so a dropped
+  control connection doesn't leave the camera running to a limit.
+
+## Troubleshooting
+
+- **PTZ not responding / one camera's ONVIF is down** → check that camera's
+  **ONVIF Enabled** toggle is on and it has a unique **ONVIF Port**.
+- **Frigate "no frames" / jittery video** → turn off Scrypted Prebuffer for the
+  camera (see above); the camera is being over-connected.
+- **`[ONVIF Events] Camera does not appear to support ONVIF events`** → harmless;
+  the plugin tried the native event proxy, the camera didn't support it, and it
+  stopped retrying.
+- **Install fails** → make sure you're on a recent version; the package ships a
+  `dist/plugin.zip` (older 1.0.x npm builds were mispackaged and won't install).
 
 ## License
 
 MIT
-
-## Author
-
-Joshua Blasbalg
