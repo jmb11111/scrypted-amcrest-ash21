@@ -29,6 +29,8 @@ class AmcrestASH21Camera extends ScryptedDeviceBase implements Camera, VideoCame
     private dvripConnecting: Promise<boolean> | null = null;
     private onvifServer: OnvifServer | null = null;
     private onvifServerStarting: Promise<void> | null = null;
+    // Pending auto-stop timers for relative moves, keyed by axis
+    private ptzStopTimers: Map<string, NodeJS.Timeout> = new Map();
 
     constructor(nativeId: string) {
         super(nativeId);
@@ -73,6 +75,11 @@ class AmcrestASH21Camera extends ScryptedDeviceBase implements Camera, VideoCame
 
     private getDvripPort(): number {
         return parseInt(this.storage.getItem('dvripPort') || '37777');
+    }
+
+    private getPtzMoveDurationMs(): number {
+        const parsed = parseInt(this.storage.getItem('ptzMoveDurationMs') || '');
+        return Number.isFinite(parsed) && parsed > 0 ? parsed : 300;
     }
 
     private isOnvifEnabled(): boolean {
@@ -179,16 +186,14 @@ class AmcrestASH21Camera extends ScryptedDeviceBase implements Camera, VideoCame
     }
 
     private async handleOnvifPtz(command: any): Promise<void> {
-        const getSpeed = (value: number | undefined): number => {
-            if (value === undefined || value === 0) return 0;
-            return Math.min(8, Math.max(1, Math.ceil(Math.abs(value) * 8)));
-        };
-
         if (command.type === 'stop') {
-            // Stop all movement
-            await this.ptzWithRetry('Left', 0, 'stop').catch(() => {});
-            await this.ptzWithRetry('Up', 0, 'stop').catch(() => {});
-            await this.ptzWithRetry('ZoomIn', 0, 'stop').catch(() => {});
+            // Stop all movement; the three axis stops are independent, send in parallel
+            this.clearAllAutoStops();
+            await Promise.all([
+                this.ptzWithRetry('Left', 0, 'stop').catch(() => {}),
+                this.ptzWithRetry('Up', 0, 'stop').catch(() => {}),
+                this.ptzWithRetry('ZoomIn', 0, 'stop').catch(() => {}),
+            ]);
             return;
         }
 
@@ -197,38 +202,31 @@ class AmcrestASH21Camera extends ScryptedDeviceBase implements Camera, VideoCame
         const zoom = command.zoom || 0;
 
         if (command.type === 'continuous') {
-            // Continuous move - start movement in direction
+            // Continuous move - start movement in each direction, in parallel
+            const moves: Promise<void>[] = [];
             if (pan !== 0) {
                 const direction = pan > 0 ? 'Right' : 'Left';
-                await this.ptzWithRetry(direction, getSpeed(pan), 'start');
+                this.clearAutoStop('pan');
+                moves.push(this.ptzWithRetry(direction, this.toDvripSpeed(pan), 'start'));
             }
             if (tilt !== 0) {
                 const direction = tilt > 0 ? 'Up' : 'Down';
-                await this.ptzWithRetry(direction, getSpeed(tilt), 'start');
+                this.clearAutoStop('tilt');
+                moves.push(this.ptzWithRetry(direction, this.toDvripSpeed(tilt), 'start'));
             }
             if (zoom !== 0) {
                 const direction = zoom > 0 ? 'ZoomIn' : 'ZoomOut';
-                await this.ptzWithRetry(direction, getSpeed(zoom), 'start');
+                this.clearAutoStop('zoom');
+                moves.push(this.ptzWithRetry(direction, this.toDvripSpeed(zoom), 'start'));
             }
-        } else if (command.type === 'relative') {
-            // Relative move - move briefly then stop
-            const duration = 300; // ms
-
-            if (pan !== 0) {
-                const direction = pan > 0 ? 'Right' : 'Left';
-                await this.ptzWithRetry(direction, getSpeed(pan), 'start');
-                setTimeout(() => this.ptzWithRetry(direction, 0, 'stop').catch(() => {}), duration);
-            }
-            if (tilt !== 0) {
-                const direction = tilt > 0 ? 'Up' : 'Down';
-                await this.ptzWithRetry(direction, getSpeed(tilt), 'start');
-                setTimeout(() => this.ptzWithRetry(direction, 0, 'stop').catch(() => {}), duration);
-            }
-            if (zoom !== 0) {
-                const direction = zoom > 0 ? 'ZoomIn' : 'ZoomOut';
-                await this.ptzWithRetry(direction, getSpeed(zoom), 'start');
-                setTimeout(() => this.ptzWithRetry(direction, 0, 'stop').catch(() => {}), duration);
-            }
+            await Promise.all(moves);
+        } else if (command.type === 'relative' || command.type === 'absolute') {
+            // Relative move - move briefly then stop. The camera has no position
+            // feedback over DVRIP, so absolute moves are approximated as a nudge
+            // toward the requested position.
+            await this.ptzRelativeMove(pan, tilt, zoom);
+        } else if (command.type === 'preset' || command.type === 'home') {
+            this.console.warn(`[ONVIF] ${command.type} commands are not supported by the DVRIP bridge; ignoring`);
         }
     }
 
@@ -278,6 +276,14 @@ class AmcrestASH21Camera extends ScryptedDeviceBase implements Camera, VideoCame
                 value: this.getDvripPort().toString(),
                 type: 'number',
                 placeholder: '37777',
+            },
+            {
+                key: 'ptzMoveDurationMs',
+                title: 'PTZ Move Duration (ms)',
+                description: 'How long a relative PTZ move runs before it is automatically stopped',
+                value: this.getPtzMoveDurationMs().toString(),
+                type: 'number',
+                placeholder: '300',
             },
             {
                 key: 'onvifEnabled',
@@ -384,6 +390,65 @@ class AmcrestASH21Camera extends ScryptedDeviceBase implements Camera, VideoCame
         return this.dvrip!;
     }
 
+    // Map normalized magnitude (-1..1) to DVRIP speed (1..8)
+    private toDvripSpeed(value: number | undefined): number {
+        if (value === undefined || value === 0) return 0;
+        return Math.min(8, Math.max(1, Math.ceil(Math.abs(value) * 8)));
+    }
+
+    private clearAutoStop(axis: 'pan' | 'tilt' | 'zoom'): void {
+        const timer = this.ptzStopTimers.get(axis);
+        if (timer) {
+            clearTimeout(timer);
+            this.ptzStopTimers.delete(axis);
+        }
+    }
+
+    private clearAllAutoStops(): void {
+        for (const timer of this.ptzStopTimers.values()) {
+            clearTimeout(timer);
+        }
+        this.ptzStopTimers.clear();
+    }
+
+    private scheduleAutoStop(axis: 'pan' | 'tilt' | 'zoom', direction: string, durationMs: number): void {
+        // Replace any pending stop so a rapid follow-up move isn't cut short
+        // by the previous move's timer.
+        this.clearAutoStop(axis);
+        this.ptzStopTimers.set(axis, setTimeout(() => {
+            this.ptzStopTimers.delete(axis);
+            this.ptzWithRetry(direction, 0, 'stop').catch(() => {});
+        }, durationMs));
+    }
+
+    // Shared relative-move implementation: start each requested axis (in
+    // parallel), then auto-stop after the configured duration.
+    private async ptzRelativeMove(pan: number, tilt: number, zoom: number): Promise<void> {
+        const duration = this.getPtzMoveDurationMs();
+        const moves: Promise<void>[] = [];
+
+        if (pan !== 0) {
+            const direction = pan > 0 ? 'Right' : 'Left';
+            this.clearAutoStop('pan');
+            moves.push(this.ptzWithRetry(direction, this.toDvripSpeed(pan), 'start')
+                .then(() => this.scheduleAutoStop('pan', direction, duration)));
+        }
+        if (tilt !== 0) {
+            const direction = tilt > 0 ? 'Up' : 'Down';
+            this.clearAutoStop('tilt');
+            moves.push(this.ptzWithRetry(direction, this.toDvripSpeed(tilt), 'start')
+                .then(() => this.scheduleAutoStop('tilt', direction, duration)));
+        }
+        if (zoom !== 0) {
+            const direction = zoom > 0 ? 'ZoomIn' : 'ZoomOut';
+            this.clearAutoStop('zoom');
+            moves.push(this.ptzWithRetry(direction, this.toDvripSpeed(zoom), 'start')
+                .then(() => this.scheduleAutoStop('zoom', direction, duration)));
+        }
+
+        await Promise.all(moves);
+    }
+
     private async ptzWithRetry(direction: string, speed: number, action: 'start' | 'stop'): Promise<void> {
         let dvrip = await this.ensureDvripConnected();
         try {
@@ -463,6 +528,7 @@ class AmcrestASH21Camera extends ScryptedDeviceBase implements Camera, VideoCame
 
     // Cleanup when device is released
     async release(): Promise<void> {
+        this.clearAllAutoStops();
         await this.stopOnvifServer();
         if (this.dvrip) {
             this.dvrip.disconnect();
@@ -472,42 +538,8 @@ class AmcrestASH21Camera extends ScryptedDeviceBase implements Camera, VideoCame
 
     // PanTiltZoom interface
     async ptzCommand(command: PanTiltZoomCommand): Promise<void> {
-        // Map normalized values (-1 to 1) to DVRIP commands
-        // Speed is derived from magnitude
-        const getSpeed = (value: number | undefined): number => {
-            if (value === undefined) return 0;
-            return Math.min(8, Math.max(1, Math.ceil(Math.abs(value) * 8)));
-        };
-
-        const pan = command.pan;
-        const tilt = command.tilt;
-        const zoom = command.zoom;
-
         try {
-            // Handle pan
-            if (pan !== undefined && pan !== 0) {
-                const direction = pan > 0 ? 'Right' : 'Left';
-                const speed = getSpeed(pan);
-                await this.ptzWithRetry(direction, speed, 'start');
-                // Stop after brief movement for relative control
-                setTimeout(() => this.ptzWithRetry(direction, 0, 'stop').catch(() => {}), 200);
-            }
-
-            // Handle tilt
-            if (tilt !== undefined && tilt !== 0) {
-                const direction = tilt > 0 ? 'Up' : 'Down';
-                const speed = getSpeed(tilt);
-                await this.ptzWithRetry(direction, speed, 'start');
-                setTimeout(() => this.ptzWithRetry(direction, 0, 'stop').catch(() => {}), 200);
-            }
-
-            // Handle zoom
-            if (zoom !== undefined && zoom !== 0) {
-                const direction = zoom > 0 ? 'ZoomIn' : 'ZoomOut';
-                const speed = getSpeed(zoom);
-                await this.ptzWithRetry(direction, speed, 'start');
-                setTimeout(() => this.ptzWithRetry(direction, 0, 'stop').catch(() => {}), 200);
-            }
+            await this.ptzRelativeMove(command.pan ?? 0, command.tilt ?? 0, command.zoom ?? 0);
         } catch (e: any) {
             this.console.error('PTZ command error:', e.message);
             throw e;
