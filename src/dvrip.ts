@@ -133,6 +133,9 @@ export class DahuaDVRIP {
         return new Promise((resolve, reject) => {
             this.socket = new net.Socket();
             this.socket.setTimeout(10000);
+            // Detect half-open connections (Wi-Fi blips / camera reboots): the OS probes
+            // an idle peer so a dead link surfaces instead of writes vanishing silently.
+            this.socket.setKeepAlive(true, 5000);
 
             this.socket.on('connect', () => {
                 this.running = true;
@@ -157,6 +160,10 @@ export class DahuaDVRIP {
 
             this.socket.on('close', () => {
                 this.running = false;
+                if (this.keepaliveInterval) {
+                    clearInterval(this.keepaliveInterval);
+                    this.keepaliveInterval = null;
+                }
                 this.console.log('[DVRIP] Connection closed');
                 this.rejectAllPending(new Error('Connection closed'));
             });

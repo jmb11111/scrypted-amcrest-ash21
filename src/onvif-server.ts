@@ -155,9 +155,15 @@ export class OnvifServer extends EventEmitter {
             const urlMatch = response.match(/<(?:[^:>]+:)?Address[^>]*>\s*(http[^<\s]+)\s*<\/(?:[^:>]+:)?Address>/);
             if (!urlMatch) throw new Error('No subscription URL in response');
             this.nativeSubscriptionUrl = urlMatch[1].trim();
+            let lastRenew = Date.now();
             this.console.log('[ONVIF Events] Subscribed to native camera:', this.nativeSubscriptionUrl);
             while (this.running) {
                 await this.pollNativeEvents(username, password);
+                // Renew well before the PT1H subscription expires to avoid an hourly event gap.
+                if (Date.now() - lastRenew > 45 * 60 * 1000) {
+                    await this.renewNativeSubscription(username, password);
+                    lastRenew = Date.now();
+                }
             }
         } catch (e: any) {
             this.console.error('[ONVIF Events] Proxy error:', e?.message, '— retrying in 30s');
@@ -187,6 +193,23 @@ export class OnvifServer extends EventEmitter {
         for (const xml of notifications) {
             this.queueEvent({ xml, timestamp: new Date() });
         }
+    }
+
+    private async renewNativeSubscription(username: string, password: string): Promise<void> {
+        if (!this.nativeSubscriptionUrl) return;
+        const renewBody = `<?xml version="1.0" encoding="UTF-8"?>
+<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"
+            xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing"
+            xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2">
+  <s:Header>
+    <wsa:Action>http://docs.oasis-open.org/wsn/bw-2/SubscriptionManager/RenewRequest</wsa:Action>
+  </s:Header>
+  <s:Body>
+    <wsnt:Renew><wsnt:TerminationTime>PT1H</wsnt:TerminationTime></wsnt:Renew>
+  </s:Body>
+</s:Envelope>`;
+        await this.httpDigestPost(this.nativeSubscriptionUrl, username, password, renewBody);
+        this.console.log('[ONVIF Events] Renewed native subscription');
     }
 
     private queueEvent(event: ProxiedEvent): void {

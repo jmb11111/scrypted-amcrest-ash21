@@ -580,6 +580,23 @@ class AmcrestASH21Provider extends ScryptedDeviceBase implements DeviceProvider,
         }
     }
 
+    private getNextOnvifPort(): number {
+        // Persist assigned ports so a restart race (adding a camera before existing
+        // devices are instantiated) can't hand out a colliding port.
+        let assigned: number[] = [];
+        try {
+            assigned = JSON.parse(this.storage.getItem('assignedOnvifPorts') || '[]');
+        } catch {
+            assigned = [];
+        }
+        let port = 8483;
+        while (assigned.includes(port))
+            port++;
+        assigned.push(port);
+        this.storage.setItem('assignedOnvifPorts', JSON.stringify(assigned));
+        return port;
+    }
+
     private async addCamera(ip: string): Promise<void> {
         if (!/^[a-zA-Z0-9._-]+$/.test(ip)) {
             this.console.error(`Invalid camera address "${ip}" - enter an IP address or hostname`);
@@ -600,10 +617,14 @@ class AmcrestASH21Provider extends ScryptedDeviceBase implements DeviceProvider,
             ],
         });
 
-        // Set default host after device is created
+        // Configure the new device: host, a free ONVIF port, and ONVIF enabled by
+        // default (putSetting also starts the server) so PTZ works out of the box and
+        // a second camera doesn't silently stay off.
         const device = await this.getDevice(nativeId);
         if (device && device.storage) {
             device.storage.setItem('host', ip);
+            device.storage.setItem('onvifPort', String(this.getNextOnvifPort()));
+            await device.putSetting('onvifEnabled', 'true');
         }
 
         this.console.log(`Added camera ${ip} as ${nativeId}. Open the new device to set credentials and enable the ONVIF server.`);
