@@ -468,16 +468,25 @@ class AmcrestASH21Camera extends ScryptedDeviceBase implements Camera, VideoCame
     }
 
     private async ptzWithRetry(direction: string, speed: number, action: 'start' | 'stop'): Promise<void> {
-        let dvrip = await this.ensureDvripConnected();
+        // Stateless: open a fresh, short-lived DVRIP connection per command. With no
+        // persistent socket there's nothing to go half-open/stale, so a PTZ command can
+        // never silently vanish into a zombie connection (which was the whole class of
+        // "PTZ dead until reboot" bugs). Costs ~1s connect+login per command — a fine
+        // trade for user-driven PTZ that never wedges. A STOP therefore always lands.
+        const dvrip = new DahuaDVRIP({
+            host: this.getHost(),
+            port: this.getDvripPort(),
+            username: this.getUsername(),
+            password: this.getPassword(),
+            console: this.console,
+        });
         try {
+            await dvrip.connect();
+            const ok = await dvrip.login();
+            if (!ok) throw new Error('DVRIP login failed');
             await dvrip.ptzControl(direction, speed, action);
-        } catch (e: any) {
-            // One reconnect-and-retry so a dropped/idle connection doesn't fail the command
-            this.console.warn(`[DVRIP] ptz.${action} ${direction} failed (${e.message}), reconnecting and retrying...`);
-            this.dvrip?.disconnect();
-            this.dvrip = null;
-            dvrip = await this.ensureDvripConnected();
-            await dvrip.ptzControl(direction, speed, action);
+        } finally {
+            dvrip.disconnect();
         }
     }
 
