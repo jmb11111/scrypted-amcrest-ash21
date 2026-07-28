@@ -450,9 +450,9 @@ export class DahuaDVRIP {
         };
 
         const method = action === 'start' ? 'ptz.start' : 'ptz.stop';
-        // Shorter timeout than the default so a stale/half-open socket is detected in
-        // seconds and ptzWithRetry can reconnect — a lost stop mustn't linger.
-        return this.sendCommand(method, params, 5000);
+        // Short timeout so a stale/half-open socket is detected fast and ptzWithRetry can
+        // reconnect — a lost STOP must not linger while the motor keeps spinning.
+        return this.sendCommand(method, params, 2500);
     }
 
     disconnect(): void {

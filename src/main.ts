@@ -84,9 +84,11 @@ class AmcrestASH21Camera extends ScryptedDeviceBase implements Camera, VideoCame
 
     private getContinuousFailsafeMs(): number {
         // Max time a continuous move may run before the plugin auto-stops it, so a lost
-        // STOP can't jam the motor at a limit. A real STOP/new move cancels/refreshes it.
+        // STOP can't spin the motor into a physical limit and jam it. Kept short (1s) on
+        // purpose: a held pan re-triggers, but a *lost* stop can only cause a small nudge.
+        // Raise ptzContinuousFailsafeMs if your camera pans slowly enough to want longer.
         const parsed = parseInt(this.storage.getItem('ptzContinuousFailsafeMs') || '');
-        return Number.isFinite(parsed) && parsed > 0 ? parsed : 3000;
+        return Number.isFinite(parsed) && parsed > 0 ? parsed : 1000;
     }
 
     private isOnvifEnabled(): boolean {
