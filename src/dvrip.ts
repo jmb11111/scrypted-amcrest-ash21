@@ -145,6 +145,14 @@ export class DahuaDVRIP {
 
             this.socket.on('error', (err) => {
                 this.console.error(`[DVRIP] Socket error: ${err.message}`);
+                // Mark the connection dead so the next command reconnects instead of
+                // reusing a broken socket (commands would otherwise vanish silently).
+                this.running = false;
+                if (this.keepaliveInterval) {
+                    clearInterval(this.keepaliveInterval);
+                    this.keepaliveInterval = null;
+                }
+                this.rejectAllPending(err);
                 reject(err);
             });
 
@@ -375,7 +383,7 @@ export class DahuaDVRIP {
         }, 25000);
     }
 
-    async sendCommand(method: string, params: Record<string, any> = {}): Promise<any> {
+    async sendCommand(method: string, params: Record<string, any> = {}, timeoutMs: number = 10000): Promise<any> {
         if (!this.socket || !this.running) {
             throw new Error('Not connected');
         }
@@ -406,7 +414,7 @@ export class DahuaDVRIP {
             const timeout = setTimeout(() => {
                 this.pendingResolvers.delete(id);
                 reject(new Error(`Command timeout: ${method}`));
-            }, 10000);
+            }, timeoutMs);
 
             this.pendingResolvers.set(id, {
                 resolve: (data) => {
@@ -442,7 +450,9 @@ export class DahuaDVRIP {
         };
 
         const method = action === 'start' ? 'ptz.start' : 'ptz.stop';
-        return this.sendCommand(method, params);
+        // Shorter timeout than the default so a stale/half-open socket is detected in
+        // seconds and ptzWithRetry can reconnect — a lost stop mustn't linger.
+        return this.sendCommand(method, params, 5000);
     }
 
     disconnect(): void {

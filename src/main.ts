@@ -82,6 +82,13 @@ class AmcrestASH21Camera extends ScryptedDeviceBase implements Camera, VideoCame
         return Number.isFinite(parsed) && parsed > 0 ? parsed : 300;
     }
 
+    private getContinuousFailsafeMs(): number {
+        // Max time a continuous move may run before the plugin auto-stops it, so a lost
+        // STOP can't jam the motor at a limit. A real STOP/new move cancels/refreshes it.
+        const parsed = parseInt(this.storage.getItem('ptzContinuousFailsafeMs') || '');
+        return Number.isFinite(parsed) && parsed > 0 ? parsed : 3000;
+    }
+
     private isOnvifEnabled(): boolean {
         return this.storage.getItem('onvifEnabled') === 'true';
     }
@@ -206,22 +213,26 @@ class AmcrestASH21Camera extends ScryptedDeviceBase implements Camera, VideoCame
         const zoom = command.zoom || 0;
 
         if (command.type === 'continuous') {
-            // Continuous move - start movement in each direction, in parallel
+            // Continuous move. Attach a FAILSAFE auto-stop to every axis: if the client's
+            // STOP is lost (dropped/half-open connection), the motor still stops instead of
+            // running to a physical limit and jamming. A real STOP or a new move cancels or
+            // refreshes it, so normal held moves are unaffected up to failsafeMs.
+            const failsafeMs = this.getContinuousFailsafeMs();
             const moves: Promise<void>[] = [];
             if (pan !== 0) {
                 const direction = pan > 0 ? 'Right' : 'Left';
-                this.clearAutoStop('pan');
-                moves.push(this.ptzWithRetry(direction, this.toDvripSpeed(pan), 'start'));
+                moves.push(this.ptzWithRetry(direction, this.toDvripSpeed(pan), 'start')
+                    .then(() => this.scheduleAutoStop('pan', direction, failsafeMs)));
             }
             if (tilt !== 0) {
                 const direction = tilt > 0 ? 'Up' : 'Down';
-                this.clearAutoStop('tilt');
-                moves.push(this.ptzWithRetry(direction, this.toDvripSpeed(tilt), 'start'));
+                moves.push(this.ptzWithRetry(direction, this.toDvripSpeed(tilt), 'start')
+                    .then(() => this.scheduleAutoStop('tilt', direction, failsafeMs)));
             }
             if (zoom !== 0) {
                 const direction = zoom > 0 ? 'ZoomIn' : 'ZoomOut';
-                this.clearAutoStop('zoom');
-                moves.push(this.ptzWithRetry(direction, this.toDvripSpeed(zoom), 'start'));
+                moves.push(this.ptzWithRetry(direction, this.toDvripSpeed(zoom), 'start')
+                    .then(() => this.scheduleAutoStop('zoom', direction, failsafeMs)));
             }
             await Promise.all(moves);
         } else if (command.type === 'relative' || command.type === 'absolute') {
